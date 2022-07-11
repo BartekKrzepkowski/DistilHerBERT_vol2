@@ -39,6 +39,7 @@ class DistilTrainer(object):
 
     def at_exp_start(self, exp_name, random_seed):
         self.manual_seed(random_seed)
+        print('is fp16?',self.accelerator.use_fp16)
         date = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         base_path = os.path.join(os.getcwd(), f'exps/{exp_name}/{date}')
         save_path = f'{base_path}/checkpoints'
@@ -65,22 +66,25 @@ class DistilTrainer(object):
             masked_mask = masked_mask.view(-1)
             labels = labels.view(-1)[masked_mask]
 
-            y_pred_student = self.student(input_ids=input_ids, attention_mask=attention_mask)[0]
-            y_pred_student = y_pred_student.view(-1, y_pred_student.size(-1))[masked_mask]
-            y_pred_student = y_pred_student @ self.student.embeddings.word_embeddings.weight.T
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                y_pred_student = self.student(input_ids=input_ids, attention_mask=attention_mask)[0]
+                y_pred_student = y_pred_student.view(-1, y_pred_student.size(-1))[masked_mask]
+                y_pred_student = y_pred_student @ self.student.embeddings.word_embeddings.weight.T
 
-            with torch.no_grad():
-                y_pred_teacher = self.teacher(input_ids=input_ids, attention_mask=attention_mask)['last_hidden_state']
-                y_pred_teacher = y_pred_teacher.view(-1, y_pred_teacher.size(-1))[masked_mask]
-                y_pred_teacher = y_pred_teacher @ self.teacher.embeddings.word_embeddings.weight.T
+                with torch.no_grad():
+                    y_pred_teacher = self.teacher(input_ids=input_ids, attention_mask=attention_mask)
+                    y_pred_teacher = y_pred_teacher[0]#['last_hidden_state']
+                    y_pred_teacher = y_pred_teacher.view(-1, y_pred_teacher.size(-1))[masked_mask]
+                    y_pred_teacher = y_pred_teacher @ self.teacher.embeddings.word_embeddings.weight.T
 
-            assert y_pred_student.shape == y_pred_teacher.shape
+                assert y_pred_student.shape == y_pred_teacher.shape
 
-            loss1 = self.criterion1(y_pred_student, labels)
-            loss2 = self.criterion2(F.log_softmax(y_pred_student/temp, dim=-1), F.softmax(y_pred_teacher/temp, dim=-1))
-            # loss3 = self.criterion3(y_pred_student,
-            #                         y_pred_teacher,
-            #                         torch.ones(labels.shape).to(self.device))
+                loss1 = self.criterion1(y_pred_student, labels)
+                loss2 = self.criterion2(F.log_softmax(y_pred_student/temp, dim=-1),
+                                        F.softmax(y_pred_teacher/temp, dim=-1))
+                # loss3 = self.criterion3(y_pred_student,
+                #                         y_pred_teacher,
+                #                         torch.ones(labels.shape).to(self.device))
 
             # jakies ważenie losów? może związane ze schedulerem?
             loss = (loss1 + loss2) / 2
@@ -94,7 +98,7 @@ class DistilTrainer(object):
             if 'train' in phase:
                 #loss.backward()
                 self.accelerator.backward(loss) # jedyne użycie acceleratora w trainerze
-                if (i + 1) % config_run_epoch.grad_accum_steps == 0:
+                if (i + 1) % config_run_epoch.grad_accum_steps == 0 or (i + 1) == loader_size:
                     #torch.nn.utils.clip_grad_norm_(filter(lambda p: p.requires_grad, self.student.parameters()),
                      #                              max_norm=5.0)
                     self.accelerator.clip_grad_norm_(filter(lambda p: p.requires_grad, self.student.parameters()), 3.0)
@@ -111,23 +115,24 @@ class DistilTrainer(object):
             running_loss += loss.item() * denom
             running_denom += denom
             # loggers
-            if (i + 1) % config_run_epoch.running_step == 0:
+            if (i + 1) % config_run_epoch.grad_accum_steps == 0 or (i + 1) == loader_size:
                 tmp_loss1 = running_loss1 / running_denom
                 tmp_loss2 = running_loss2 / running_denom
                 # tmp_loss3 = running_loss3 / running_denom
                 tmp_loss = running_loss / running_denom
 
                 progress_bar.set_postfix({'mlm': tmp_loss1, 'distil': tmp_loss2, 'loss': tmp_loss})
+                global_step = i + 1 + epoch * loader_size
 
-                self.n_logger[f'MLM Loss/{phase}'].log(tmp_loss1)
-                self.n_logger[f'Distil Loss/{phase}'].log(tmp_loss2)
-                # self.n_logger[f'Cosine Loss/{phase}'].log(tmp_loss3)
-                self.n_logger[f'Loss/{phase}'].log(tmp_loss)
+                self.n_logger[f'MLM Loss/{phase}'].log(tmp_loss1, step=global_step)
+                self.n_logger[f'Distil Loss/{phase}'].log(tmp_loss2, step=global_step)
+                # self.n_logger[f'Cosine Loss/{phase}'].log(tmp_loss3, step=global_step)
+                self.n_logger[f'Loss/{phase}'].log(tmp_loss, step=global_step)
 
-                self.t_logger.log_scalar(f'MLM Loss/{phase}', round(tmp_loss1, 4), i + 1 + epoch * loader_size)
-                self.t_logger.log_scalar(f'Distil Loss/{phase}', round(tmp_loss2, 4), i + 1 + epoch * loader_size)
-                # self.t_logger.log_scalar(f'Cosine Loss/{phase}', round(tmp_loss3, 4), i + 1 + epoch * loader_size)
-                self.t_logger.log_scalar(f'Loss/{phase}', round(tmp_loss, 4), i + 1 + epoch * loader_size)
+                self.t_logger.log_scalar(f'MLM Loss/{phase}', round(tmp_loss1, 4), global_step)
+                self.t_logger.log_scalar(f'Distil Loss/{phase}', round(tmp_loss2, 4), global_step)
+                # self.t_logger.log_scalar(f'Cosine Loss/{phase}', round(tmp_loss3, 4), global_step)
+                self.t_logger.log_scalar(f'Loss/{phase}', round(tmp_loss, 4), global_step)
 
                 running_loss1 = 0.0
                 running_loss2 = 0.0
@@ -135,8 +140,8 @@ class DistilTrainer(object):
                 running_loss = 0.0
                 running_denom = 0.0
 
-                if (i + 1) % config_run_epoch.save_interval == 0:
-                    self.save_student(save_path)
+                # if (i + 1) % config_run_epoch.save_interval == 0:
+                #     self.save_student(save_path)
 
     def save_student(self, path):
         torch.save(self.student.state_dict(), f"{path}/student_{datetime.datetime.utcnow()}.pth")
