@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from logger.logger import NeptuneLogger
-from trainers.utils import get_acc, dynamically_freeze_layers
+from trainers.utils_model import get_acc, dynamically_freeze_layers
 from trainers.tensorboard_pytorch import TensorboardPyTorch
 
 

@@ -7,13 +7,13 @@ from tqdm.auto import tqdm
 
 import wandb
 from logger.logger import NeptuneLogger, WandbLogger
-from trainers.utils import create_masked_ids, get_masked_mask_hf_collator
+from trainers.utils_model import create_masked_ids, get_masked_mask_hf_collator
 from trainers.tensorboard_pytorch import TensorboardPyTorch
 
 
 class DistilTrainer(object):
     def __init__(self, teacher, student, tokenizer, loaders, criterion1, criterion2, criterion3,
-                 optim, accelerator=None, scheduler=None, device='cpu'):
+                 optim, accelerator=None, lr_scheduler=None, device='cpu'):
         self.teacher = teacher
         self.student = student
         self.tokenizer = tokenizer
@@ -22,7 +22,7 @@ class DistilTrainer(object):
         self.criterion3 = criterion3    # cosine
         self.optim = optim
         self.accelerator = accelerator
-        self.scheduler = scheduler
+        self.lr_scheduler = lr_scheduler
         self.loaders = loaders
         self.n_logger = None  # neptune logger
         self.t_logger = None  # tensorflow logger
@@ -47,7 +47,7 @@ class DistilTrainer(object):
         save_path = f'{base_path}/checkpoints'
         os.makedirs(save_path)
         WandbLogger(wandb, exp_name, 0)
-        wandb.tensorboard.patch(root_logdir=f'{base_path}/tensorboard', pytorch=True, save=False)
+        # wandb.tensorboard.patch(root_logdir=f'{base_path}/tensorboard', pytorch=True, save=True)
         # wandb.watch(self.student, log_freq=1000, idx=0, log_graph=True, log='all', criterion=self.criterion1)
         self.t_logger = TensorboardPyTorch(f'{base_path}/tensorboard', self.device)
         # self.n_logger = NeptuneLogger(exp_name)
@@ -56,7 +56,7 @@ class DistilTrainer(object):
     def run_epoch(self, epoch, save_path, config_run_epoch, phase, temp):
         running_loss1 = 0.0
         running_loss2 = 0.0
-        # running_loss3 = 0.0
+        running_loss3 = 0.0
         running_loss = 0.0
         running_denom = 0.0
         global_step = 0
@@ -68,8 +68,8 @@ class DistilTrainer(object):
         for i, data in enumerate(progress_bar):
             global_step += 1
             # self.n_logger['step'].log(i)
-            wandb.log({'step': i})
-            input_ids, labels = data['input_ids'], data['labels']#.to(self.device)
+            wandb.log({'step': i}, step=global_step)
+            input_ids, labels = data['input_ids'], data['labels']
 
             attention_mask = (input_ids != 1).long()
             masked_mask = get_masked_mask_hf_collator(labels)
@@ -79,25 +79,25 @@ class DistilTrainer(object):
             with torch.autocast(device_type='cuda', dtype=torch.float16):
                 y_pred_student = self.student(input_ids=input_ids, attention_mask=attention_mask)[0]
                 y_pred_student = y_pred_student.view(-1, y_pred_student.size(-1))[masked_mask]
-                y_pred_student = y_pred_student @ self.student.embeddings.word_embeddings.weight.T
+                # y_pred_student = y_pred_student @ self.student.embeddings.word_embeddings.weight.T
 
                 with torch.no_grad():
                     y_pred_teacher = self.teacher(input_ids=input_ids, attention_mask=attention_mask)
                     y_pred_teacher = y_pred_teacher[0]#['last_hidden_state']
                     y_pred_teacher = y_pred_teacher.view(-1, y_pred_teacher.size(-1))[masked_mask]
-                    y_pred_teacher = y_pred_teacher @ self.teacher.embeddings.word_embeddings.weight.T
+                    # y_pred_teacher = y_pred_teacher @ self.teacher.embeddings.word_embeddings.weight.T
 
                 assert y_pred_student.shape == y_pred_teacher.shape
 
                 loss1 = self.criterion1(y_pred_student, labels)
                 loss2 = self.criterion2(F.log_softmax(y_pred_student/temp, dim=-1),
                                         F.softmax(y_pred_teacher/temp, dim=-1))
-                # loss3 = self.criterion3(y_pred_student,
-                #                         y_pred_teacher,
-                #                         torch.ones(labels.shape).to(self.device))
+                loss3 = self.criterion3(y_pred_student,
+                                        y_pred_teacher,
+                                        torch.ones(labels.shape).to(self.device))
 
             # jakies ważenie losów? może związane ze schedulerem?
-            loss = (loss1 + loss2) / 2
+            loss = (loss1 + loss2 + loss3) / 3
 
             # self.n_logger['train_every_step1_mlm_loss'].log(loss1.item())
             # self.n_logger['train_every_step2_distill_loss'].log(loss2.item())
@@ -115,27 +115,30 @@ class DistilTrainer(object):
                 if (i + 1) % config_run_epoch.grad_accum_steps == 0 or (i + 1) == loader_size:
                     self.accelerator.clip_grad_norm_(filter(lambda p: p.requires_grad, self.student.parameters()), 3.0)
                     self.optim.step()
-                    if self.scheduler is not None:
-                        self.scheduler.step()
+                    if self.lr_scheduler is not None:
+                        self.lr_scheduler.step()
                     self.optim.zero_grad()
             loss *= config_run_epoch.grad_accum_steps
 
             denom = labels.size(0)
             running_loss1 += loss1.item() * denom
             running_loss2 += loss2.item() * denom
-            # running_loss3 += loss3.item() * denom
+            running_loss3 += loss3.item() * denom
             running_loss += loss.item() * denom
             running_denom += denom
             # loggers
             if (i + 1) % config_run_epoch.grad_accum_steps == 0 or (i + 1) == loader_size:
                 tmp_loss1 = running_loss1 / running_denom
                 tmp_loss2 = running_loss2 / running_denom
-                # tmp_loss3 = running_loss3 / running_denom
+                tmp_loss3 = running_loss3 / running_denom
                 tmp_loss = running_loss / running_denom
                 losses = {f'mlm/{phase}': round(tmp_loss1, 4), f'distil/{phase}': round(tmp_loss2, 4),
-                          f'loss/{phase}': round(tmp_loss, 4)}
+                          f'loss/{phase}': round(tmp_loss, 4), f'cosine/{phase}': round(tmp_loss3, 4)}
 
                 progress_bar.set_postfix(losses)
+                wandb.log(losses, step=global_step)
+                if self.lr_scheduler is not None:
+                    wandb.log({'lr_scheduler': self.lr_scheduler.get_last_lr()[0]}, step=global_step)
 
                 # self.n_logger[f'MLM Loss/{phase}'].log(losses[f'mlm/{phase}'], step=global_step)
                 # self.n_logger[f'Distil Loss/{phase}'].log(losses[f'distil/{phase}'], step=global_step)
@@ -144,12 +147,12 @@ class DistilTrainer(object):
 
                 self.t_logger.log_scalar(f'MLM Loss/{phase}', losses[f'mlm/{phase}'], global_step)
                 self.t_logger.log_scalar(f'Distil Loss/{phase}', losses[f'distil/{phase}'], global_step)
-                # self.t_logger.log_scalar(f'Cosine Loss/{phase}', losses[f'cosine/{phase}'], global_step)
+                self.t_logger.log_scalar(f'Cosine Loss/{phase}', losses[f'cosine/{phase}'], global_step)
                 self.t_logger.log_scalar(f'Loss/{phase}', losses[f'loss/{phase}'], global_step)
 
                 running_loss1 = 0.0
                 running_loss2 = 0.0
-                # running_loss3 = 0.0
+                running_loss3 = 0.0
                 running_loss = 0.0
                 running_denom = 0.0
 
@@ -162,6 +165,7 @@ class DistilTrainer(object):
 
     def manual_seed(self, random_seed):
         if 'cuda' in self.device.type:
+            torch.cuda.empty_cache()
             torch.backends.cudnn.deterministic = True
             torch.cuda.manual_seed_all(random_seed)
             # torch.backends.cudnn.benchmark = False

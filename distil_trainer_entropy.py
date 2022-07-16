@@ -2,14 +2,15 @@ import torch
 import accelerate
 from accelerate import Accelerator
 from torch import nn
-from transformers import DataCollatorForLanguageModeling, DataCollatorForWholeWordMask
+from models.collator import DataCollatorForWholeWordMask
 from datasets import load_from_disk
 from torch.utils.data import DataLoader
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 EPOCHS = 2
-BATCH_SIZE = 25
-GRAD_ACCUM_STEPS = 2000 // BATCH_SIZE
+BATCH_SIZE = 10
+GRAD_ACCUM_STEPS = 1000 // BATCH_SIZE
 
 
 def get_dataloaders(tokenizer, path_tokenized_dataset):
@@ -26,38 +27,39 @@ def get_dataloaders(tokenizer, path_tokenized_dataset):
 
 def run():
     # init accelerator
-    accelerator = Accelerator()#device_placement=True, fp16=True, mixed_precision='fp16')
-    device = accelerator.device
+    accelerator = Accelerator()
     deepspeed_plugin = accelerator.state.deepspeed_plugin
+    device = accelerator.device
 
-    from trainers.utils import get_teacher_student_tokenizer, print_model_size
+    from trainers.utils_model import get_teacher_student_tokenizer
     teacher, student, tokenizer = get_teacher_student_tokenizer()
-    train_loader, test_loader = get_dataloaders(tokenizer, 'data/tokenized_dataset_demo')
+    train_loader, test_loader = get_dataloaders(tokenizer, 'data/tokenized_dataset_demo2')
 
     # set accelerator
     from transformers import AdamW, get_cosine_schedule_with_warmup
-    from trainers.utils import configure_optimizer
+    from trainers.utils_model import configure_optimizer
 
     deepspeed_cond = lambda x: deepspeed_plugin is None or x not in deepspeed_plugin.deepspeed_config
     optim_wrapper = AdamW if deepspeed_cond("optimizer") else accelerate.utils.DummyOptim
     optim = configure_optimizer(optim_wrapper, student, None, lr_backbone=5e-5, lr_head=None, weight_decay=1e-3)
-    NUM_TRAINING_STEPS = len(train_loader) // GRAD_ACCUM_STEPS * EPOCHS
-    print('# of warmup steps & # of steps', int(0.01 * NUM_TRAINING_STEPS), NUM_TRAINING_STEPS)
+    NUM_TRAINING_STEPS = (len(train_loader) // GRAD_ACCUM_STEPS) * EPOCHS
+    print('Num steps', NUM_TRAINING_STEPS, int(0.01 * NUM_TRAINING_STEPS))
     if deepspeed_cond("scheduler"):
-        scheduler = get_cosine_schedule_with_warmup(
+        lr_scheduler = get_cosine_schedule_with_warmup(
             optimizer=optim,
             num_cycles=EPOCHS,
             num_warmup_steps=int(0.01 * NUM_TRAINING_STEPS),
             num_training_steps=NUM_TRAINING_STEPS)
     else:
-        scheduler = accelerate.utils.DummyScheduler(optim, total_num_steps=NUM_TRAINING_STEPS, warmup_max_lr=5e-5,
+        lr_scheduler = accelerate.utils.DummyScheduler(optim, warmup_max_lr=5e-5,
                                                     warmup_num_steps=int(0.01 * NUM_TRAINING_STEPS))
 
-    print('scheduler', scheduler.warmup_num_steps, scheduler.total_num_steps, scheduler.kwargs)
-    train_loader, test_loader, teacher, student, optim, scheduler = accelerator.prepare(
-        train_loader, test_loader, teacher, student, optim, scheduler)
+    train_loader, test_loader, teacher, student, optim, lr_scheduler = accelerator.prepare(
+        train_loader, test_loader, teacher, student, optim, lr_scheduler)
 
     loaders = {'train': train_loader, 'test': test_loader}
+    print('optim', optim)
+    print('lr_scheduler', lr_scheduler)
 
     from trainers.distilTrainer_hf_collator import DistilTrainer
     params_trainer = {
@@ -70,7 +72,7 @@ def run():
         # 'criterion2': nn.KLDivLoss('batchmean').to(device), # mam używać log_target?
         'criterion3': nn.CosineEmbeddingLoss().to(device),
         'optim': optim,
-        'scheduler': scheduler,
+        'lr_scheduler': lr_scheduler,
         'accelerator': accelerator,
         'device': device
     }
@@ -84,9 +86,9 @@ def run():
     params_run = {
         'epoch_start': 0,
         'epoch_end': EPOCHS,
-        'exp_name': f'plain_distil_hf_collator,preprocessing,deduplication,whole_word_masking_hf',
+        'exp_name': f'ZeRO2, WWM',
         'config_run_epoch': config_run_epoch,
-        'temp': 2.0,
+        'temp': 3.0,
         'random_seed': 42
     }
 

@@ -3,7 +3,7 @@ import os
 import torch
 import numpy as np
 
-from models.distil_student import creat_student
+from models.distil_student import create_student
 
 
 def dynamically_freeze_layers(model, epoch, step):
@@ -59,11 +59,12 @@ def get_masked_mask_hf_collator(labels):
 
 
 def get_teacher_student_tokenizer():
-    from transformers import AutoTokenizer, AutoModel
+    from transformers import AutoTokenizer, AutoModelForMaskedLM, set_seed
 
+    set_seed(42)
     tokenizer = AutoTokenizer.from_pretrained("allegro/herbert-base-cased")
-    teacher = AutoModel.from_pretrained("allegro/herbert-base-cased")
-    student = creat_student()
+    teacher = AutoModelForMaskedLM.from_pretrained("allegro/herbert-base-cased")
+    student = create_student()
     
     print(f'Number of parameters: Teacher: {count_parameters(teacher)}, Student: {count_parameters(student)},'
           f'Student / Teacher ratio: {round(count_parameters(student) / count_parameters(teacher), 4)}.')
