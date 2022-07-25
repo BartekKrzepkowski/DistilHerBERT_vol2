@@ -41,14 +41,15 @@ class DistilTrainer(object):
 
     def at_exp_start(self, exp_name, random_seed):
         self.manual_seed(random_seed)
-        print('is fp16?',self.accelerator.use_fp16)
+        print('is fp16?', self.accelerator.use_fp16)
         date = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         base_path = os.path.join(os.getcwd(), f'exps/{exp_name}/{date}')
         save_path = f'{base_path}/checkpoints'
-        os.makedirs(save_path)
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
         WandbLogger(wandb, exp_name, 0)
         # wandb.tensorboard.patch(root_logdir=f'{base_path}/tensorboard', pytorch=True, save=True)
-        # wandb.watch(self.student, log_freq=1000, idx=0, log_graph=True, log='all', criterion=self.criterion1)
+        wandb.watch(self.student, log_freq=1000, idx=0, log_graph=True, log='all', criterion=self.criterion1)
         self.t_logger = TensorboardPyTorch(f'{base_path}/tensorboard', self.device)
         # self.n_logger = NeptuneLogger(exp_name)
         return save_path
@@ -72,20 +73,16 @@ class DistilTrainer(object):
             input_ids, labels = data['input_ids'], data['labels']
 
             attention_mask = (input_ids != 1).long()
-            masked_mask = get_masked_mask_hf_collator(labels)
-            masked_mask = masked_mask.view(-1)
+            masked_mask = get_masked_mask_hf_collator(labels).view(-1)
             labels = labels.view(-1)[masked_mask]
 
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
-                y_pred_student = self.student(input_ids=input_ids, attention_mask=attention_mask)[0]
+            with torch.autocast(device_type=self.device, dtype=torch.float16):
+                y_pred_student = self.student(input_ids=input_ids, attention_mask=attention_mask).logits
                 y_pred_student = y_pred_student.view(-1, y_pred_student.size(-1))[masked_mask]
-                # y_pred_student = y_pred_student @ self.student.embeddings.word_embeddings.weight.T
 
                 with torch.no_grad():
-                    y_pred_teacher = self.teacher(input_ids=input_ids, attention_mask=attention_mask)
-                    y_pred_teacher = y_pred_teacher[0]#['last_hidden_state']
+                    y_pred_teacher = self.teacher(input_ids=input_ids, attention_mask=attention_mask).logits
                     y_pred_teacher = y_pred_teacher.view(-1, y_pred_teacher.size(-1))[masked_mask]
-                    # y_pred_teacher = y_pred_teacher @ self.teacher.embeddings.word_embeddings.weight.T
 
                 assert y_pred_student.shape == y_pred_teacher.shape
 
@@ -106,12 +103,12 @@ class DistilTrainer(object):
 
             # wandb
             wandb.log({'every_step/mlm': loss1.item(), 'every_step/distill': loss2.item(),
-                       'every_step/loss': loss.item()}, step=global_step)
+                       'every_step/cosine': loss3.item(), 'every_step/loss': loss.item()}, step=global_step)
 
             loss /= config_run_epoch.grad_accum_steps
             if 'train' in phase:
                 #loss.backward()
-                self.accelerator.backward(loss) # jedyne użycie acceleratora w trainerze
+                self.accelerator.backward(loss) # jedyne użycie acceleratora w trainerze, wraz z clip_grad_norm
                 if (i + 1) % config_run_epoch.grad_accum_steps == 0 or (i + 1) == loader_size:
                     self.accelerator.clip_grad_norm_(filter(lambda p: p.requires_grad, self.student.parameters()), 3.0)
                     self.optim.step()
@@ -133,7 +130,7 @@ class DistilTrainer(object):
                 tmp_loss3 = running_loss3 / running_denom
                 tmp_loss = running_loss / running_denom
                 losses = {f'mlm/{phase}': round(tmp_loss1, 4), f'distil/{phase}': round(tmp_loss2, 4),
-                          f'loss/{phase}': round(tmp_loss, 4), f'cosine/{phase}': round(tmp_loss3, 4)}
+                          f'cosine/{phase}': round(tmp_loss3, 8), f'loss/{phase}': round(tmp_loss, 4)}
 
                 progress_bar.set_postfix(losses)
                 wandb.log(losses, step=global_step)
@@ -156,12 +153,12 @@ class DistilTrainer(object):
                 running_loss = 0.0
                 running_denom = 0.0
 
-                # if (i + 1) % config_run_epoch.save_interval == 0:
-                #     self.save_student(save_path)
+                if (i + 1) % config_run_epoch.save_interval == 0 or (i + 1) == loader_size:
+                    self.save_student(save_path)
 
     def save_student(self, path):
-        torch.save(self.student.state_dict(), f"{path}/student_{datetime.datetime.utcnow()}.pth")
-        # self.student.save_pretrained(f"{path}/student_{datetime.datetime.utcnow()}.pth")
+        # torch.save(self.student.state_dict(), f"{path}/student_{datetime.datetime.utcnow()}.pth")
+        self.student.save_pretrained(f"{path}/student_{datetime.datetime.utcnow()}.pth")
 
     def manual_seed(self, random_seed):
         if 'cuda' in self.device.type:

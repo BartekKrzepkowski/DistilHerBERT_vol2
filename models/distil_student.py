@@ -22,7 +22,6 @@ def copy_weights_from_teacher_to_student(teacher, student):
         for i in range(len(student_encoding_layers)):
             student_encoding_layers[i].load_state_dict(teacher_encoding_layers[i].state_dict())
     else:
-        print(type(teacher), type(student))
         student.load_state_dict(teacher.state_dict())
 
 from transformers import AutoModelForMaskedLM
@@ -37,7 +36,7 @@ def create_student(teacher_model=None):
     teacher_config['num_hidden_layers'] //= 2
     student_model = AutoModelForMaskedLM.from_config(BertConfig.from_dict(teacher_config))
     # student_model = BertModel(BertConfig.from_dict(teacher_config), add_pooling_layer=False)
-    print(type(teacher_model), type(student_model))
+    print('Types of models T/S: ', type(teacher_model), type(student_model))
     copy_weights_from_teacher_to_student(teacher_model, student_model)
     # student_model.bert.embeddings.token_type_embeddings = Identity()
     return student_model

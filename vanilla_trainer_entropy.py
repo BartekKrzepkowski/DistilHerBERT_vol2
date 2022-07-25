@@ -33,8 +33,11 @@ def run():
     deepspeed_plugin = accelerator.state.deepspeed_plugin
     device = accelerator.device
 
-    from trainers.utils_model import get_teacher_student_tokenizer
-    teacher, student, tokenizer = get_teacher_student_tokenizer()
+    from transformers import AutoTokenizer, AutoModelForMaskedLM, set_seed
+
+    set_seed(42)
+    tokenizer = AutoTokenizer.from_pretrained("allegro/herbert-base-cased")
+    teacher = AutoModelForMaskedLM.from_pretrained("allegro/herbert-base-cased")
     train_loader, test_loader = get_dataloaders(tokenizer, 'data/tokenized_dataset_demo2')
 
     # set accelerator
@@ -45,7 +48,7 @@ def run():
     optim_wrapper = AdamW if deepspeed_cond("optimizer") else accelerate.utils.DummyOptim
     # from deepspeed.ops.lamb import FusedLamb
     # optim_wrapper = FusedLamb
-    optim = configure_optimizer(optim_wrapper, student, None, lr_backbone=5e-4, lr_head=None, weight_decay=1e-3)
+    optim = configure_optimizer(optim_wrapper, teacher, None, lr_backbone=5e-4, lr_head=None, weight_decay=1e-3)
     NUM_TRAINING_STEPS = (len(train_loader) // GRAD_ACCUM_STEPS) * EPOCHS
     print('Num steps', NUM_TRAINING_STEPS, int(0.2 * NUM_TRAINING_STEPS))
     # from deepspeed.runtime.lr_schedules import WarmupDecayLR
@@ -61,46 +64,38 @@ def run():
         lr_scheduler = accelerate.utils.DummyScheduler(optim, warmup_max_lr=5e-4, total_num_steps=NUM_TRAINING_STEPS,
                                                     warmup_num_steps=int(0.2 * NUM_TRAINING_STEPS), warmup_type='linear')
 
-    train_loader, test_loader, teacher, student, optim, lr_scheduler = accelerator.prepare(
-        train_loader, test_loader, teacher, student, optim, lr_scheduler)
+    train_loader, test_loader, teacher, optim, lr_scheduler = accelerator.prepare(
+        train_loader, test_loader, teacher, optim, lr_scheduler)
 
     loaders = {'train': train_loader, 'test': test_loader}
     print('optim:', optim)
     print('lr_scheduler:', lr_scheduler)
 
-    from trainers.distilTrainer_hf_collator import DistilTrainer
+    from trainers.vanillaTrainer_hf_collator import VanillaTrainer
     params_trainer = {
-        'teacher': teacher,
-        'student': student,
+        'model': teacher,
         'tokenizer': tokenizer,
         'loaders': loaders,
-        'criterion1': nn.CrossEntropyLoss().to(device),
-        'criterion2': nn.CrossEntropyLoss().to(device),
-        # 'criterion2': nn.KLDivLoss('batchmean').to(device), # mam używać log_target?
-        'criterion3': nn.CosineEmbeddingLoss().to(device),
+        'criterion': nn.CrossEntropyLoss().to(device),
         'optim': optim,
         'lr_scheduler': lr_scheduler,
         'accelerator': accelerator,
         'device': device
     }
-    trainer = DistilTrainer(**params_trainer)
+    trainer = VanillaTrainer(**params_trainer)
 
     import collections
     config_run_epoch = collections.namedtuple('RE', ['save_interval', 'grad_accum_steps', 'running_step'])(110000,
                                                                                                            GRAD_ACCUM_STEPS,
                                                                                                            40)
-
     params_run = {
         'epoch_start': 0,
         'epoch_end': EPOCHS,
-        'exp_name': f'ZeRO2, WWM',
+        'exp_name': f'ZeRO2, WWM, teacher_finetuning, lr:5e-4, warmup_p: 0.2',
         'config_run_epoch': config_run_epoch,
-        'temp': 3.0,
         'random_seed': 42
     }
-
     trainer.run_exp(**params_run)
-    # trainer.n_logger.run.stop()
 
 if __name__ == '__main__':
     run()
